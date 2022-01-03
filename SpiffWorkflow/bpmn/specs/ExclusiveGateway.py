@@ -48,5 +48,11 @@ class ExclusiveGateway(ExclusiveChoice, BpmnSpecMixin):
                 raise WorkflowException(self, msg)
             if condition is None:
                 continue
-        if self.default_task_spec is None:
-            raise WorkflowException(self, 'A default output is required.')
+
+    def serialize(self, serializer):
+        return serializer.serialize_exclusive_gateway(self)
+
+
+    @classmethod
+    def deserialize(self, serializer, wf_spec, s_state):
+        return serializer.deserialize_exclusive_gateway(wf_spec, s_state)

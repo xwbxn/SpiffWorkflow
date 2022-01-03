@@ -42,16 +42,25 @@ class EndEvent(Simple, BpmnSpecMixin):
      * There is no token remaining within the Process instance.
     """
 
-    def __init__(self, wf_spec, name, is_terminate_event=False, **kwargs):
+    def __init__(self, wf_spec, name, is_terminate_event=False,
+                 is_escalation_event=False, escalation_code=None,
+                 is_cancel_event=False, **kwargs):
         """
         Constructor.
 
         :param is_terminate_event: True if this is a terminating end event
+        :param is_escalation_event: True if this is a escalation end event
+        :param escalation_code: optional string with escalation code
+        for escalation end events
         """
         super(EndEvent, self).__init__(wf_spec, name, **kwargs)
         self.is_terminate_event = is_terminate_event
+        self.is_escalation_event = is_escalation_event
+        self.escalation_code = escalation_code
+        self.is_cancel_event = is_cancel_event
 
     def _on_complete_hook(self, my_task):
+        
         if self.is_terminate_event:
             # Cancel other branches in this workflow:
             for active_task in my_task.workflow.get_tasks(
@@ -69,5 +78,25 @@ class EndEvent(Simple, BpmnSpecMixin):
                             start_sibling.cancel()
 
             my_task.workflow.refresh_waiting_tasks()
+        
+        elif self.is_escalation_event:
+            # send escalation as message to outer workflow
+            wf = my_task.workflow
+            message = 'x_escalation:%s:%s' % (
+                wf.name, # this is a copy of CallActivity task spec name
+                self.escalation_code or '*',
+            )
+            wf.outer_workflow.accept_message(message)
+        
+        elif self.is_cancel_event:
+            my_task.workflow.cancel()
 
         super(EndEvent, self)._on_complete_hook(my_task)
+
+
+    def serialize(self, serializer):
+        return serializer.serialize_end_event(self)
+
+    @classmethod
+    def deserialize(self, serializer, wf_spec, s_state):
+        return serializer.deserialize_end_event(wf_spec, s_state, EndEvent)

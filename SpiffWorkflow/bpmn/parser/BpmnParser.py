@@ -22,10 +22,11 @@ import glob
 from ..workflow import BpmnWorkflow
 from .ValidationException import ValidationException
 from ..specs.BoundaryEvent import BoundaryEvent
-from ..specs.CallActivity import CallActivity
+from ..specs.SubWorkflowTask import CallActivity, TransactionSubprocess
 from ..specs.ExclusiveGateway import ExclusiveGateway
 from ..specs.InclusiveGateway import InclusiveGateway
 from ..specs.IntermediateCatchEvent import IntermediateCatchEvent
+from ..specs.IntermediateThrowEvent import IntermediateThrowEvent
 from ..specs.ManualTask import ManualTask
 from ..specs.NoneTask import NoneTask
 from ..specs.ParallelGateway import ParallelGateway
@@ -38,11 +39,12 @@ from .util import full_tag, xpath_eval, first
 from .task_parsers import (StartEventParser, EndEventParser, UserTaskParser,
                            NoneTaskParser, ManualTaskParser,
                            ExclusiveGatewayParser, ParallelGatewayParser,
-                           InclusiveGatewayParser, CallActivityParser,
+                           InclusiveGatewayParser, CallActivityParser, TransactionSubprocessParser,
                            ScriptTaskParser, IntermediateCatchEventParser,
-                           BoundaryEventParser)
-import xml.etree.ElementTree as ET
-
+                           IntermediateThrowEventParser,
+                           BoundaryEventParser,SubWorkflowParser)
+from lxml import etree
+CAMUNDA_MODEL_NS = 'http://camunda.org/schema/1.0/bpmn'
 
 class BpmnParser(object):
     """
@@ -61,6 +63,7 @@ class BpmnParser(object):
         full_tag('endEvent'): (EndEventParser, EndEvent),
         full_tag('userTask'): (UserTaskParser, UserTask),
         full_tag('task'): (NoneTaskParser, NoneTask),
+        full_tag('subProcess'): (SubWorkflowParser, CallActivity),
         full_tag('manualTask'): (ManualTaskParser, ManualTask),
         full_tag('exclusiveGateway'): (ExclusiveGatewayParser,
                                        ExclusiveGateway),
@@ -68,9 +71,12 @@ class BpmnParser(object):
         full_tag('inclusiveGateway'): (InclusiveGatewayParser,
                                        InclusiveGateway),
         full_tag('callActivity'): (CallActivityParser, CallActivity),
+        full_tag('transaction'): (TransactionSubprocessParser, TransactionSubprocess),
         full_tag('scriptTask'): (ScriptTaskParser, ScriptTask),
         full_tag('intermediateCatchEvent'): (IntermediateCatchEventParser,
                                              IntermediateCatchEvent),
+        full_tag('intermediateThrowEvent'): (IntermediateThrowEventParser,
+                                             IntermediateThrowEvent),
         full_tag('boundaryEvent'): (BoundaryEventParser, BoundaryEvent),
     }
 
@@ -100,8 +106,12 @@ class BpmnParser(object):
         """
         if process_id_or_name in self.process_parsers_by_name:
             return self.process_parsers_by_name[process_id_or_name]
-        else:
+        elif process_id_or_name in self.process_parsers:
             return self.process_parsers[process_id_or_name]
+
+    def get_process_ids(self):
+        """Returns a list of process IDs"""
+        return  self.process_parsers.keys()
 
     def add_bpmn_file(self, filename):
         """
@@ -123,7 +133,7 @@ class BpmnParser(object):
         for filename in filenames:
             f = open(filename, 'r')
             try:
-                self.add_bpmn_xml(ET.parse(f), filename=filename)
+                self.add_bpmn_xml(etree.parse(f), filename=filename)
             finally:
                 f.close()
 
@@ -136,6 +146,20 @@ class BpmnParser(object):
         :param filename: Optionally, provide the source filename.
         """
         xpath = xpath_eval(bpmn)
+        # do a check on our bpmn to ensure that no id appears twice
+        # this *should* be taken care of by our modeler - so this test
+        # should never fail.
+        ids = [x for x in xpath('.//bpmn:*[@id]')]
+        foundids = {}
+        for node in ids:
+            id = node.get('id')
+            if foundids.get(id,None) is not None:
+                raise ValidationException(
+                    'The bpmn document should have no repeating ids but (%s) repeats'%id,
+                    node=node,
+                    filename=filename)
+            else:
+                foundids[id] = 1
 
         processes = xpath('.//bpmn:process')
         for process in processes:
@@ -172,6 +196,16 @@ class BpmnParser(object):
         """
         return condition_expression
 
+    def parse_extensions(self, node, task_parser=None, xpath=None):
+        extensions = {}
+        xpath = xpath or xpath_eval(node)
+        extension_nodes = xpath(
+            './/bpmn:extensionElements/{%s}properties/{%s}property'%(
+                CAMUNDA_MODEL_NS,CAMUNDA_MODEL_NS))
+        for node in extension_nodes:
+            extensions[node.get('name')] = node.get('value')
+        return extensions
+
     def _parse_documentation(self, node, task_parser=None, xpath=None):
         xpath = xpath or xpath_eval(node)
         documentation_node = first(xpath('.//bpmn:documentation'))
@@ -192,4 +226,10 @@ class BpmnParser(object):
         instance of BpmnProcessSpec (i.e. WorkflowSpec)
         for the given process ID or name. The Name is matched first.
         """
-        return self.get_process_parser(process_id_or_name).get_spec()
+        parser = self.get_process_parser(process_id_or_name)
+        if parser is None:
+            raise Exception(
+                f"The process '{process_id_or_name}' was not found. "
+                f"Did you mean one of the following: "
+                f"{', '.join(self.get_process_ids())}?")
+        return parser.get_spec()

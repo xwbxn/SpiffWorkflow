@@ -34,7 +34,7 @@ class SerializerTest(PatternTest):
                          exclude_items=None):
         #with open('1.xml', 'w') as fp: fp.write(item1)
         #with open('2.xml', 'w') as fp: fp.write(item2)
-        self.assertEqual(item1, item2)
+        self.assertEqual(item1.decode('utf8'), item2.decode('utf8'))
 
     def _test_roundtrip_serialization(self, obj):
         # Test round trip serialization.
@@ -45,7 +45,6 @@ class SerializerTest(PatternTest):
         except TaskNotSupportedError as e:
             warnings.warn('unsupported task spec: ' + str(e))
             return
-
         self.assertIsInstance(serialized1, self.return_type)
         self.assertIsInstance(serialized2, self.return_type)
         serialized1 = self._prepare_result(serialized1)

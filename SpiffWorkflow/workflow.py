@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import division, absolute_import
 from __future__ import print_function
+
 from builtins import next
 from builtins import object
 # Copyright (C) 2007 Samuel Abels
@@ -21,12 +22,14 @@ from builtins import object
 # 02110-1301  USA
 import logging
 from . import specs
+from .specs.LoopResetTask import LoopResetTask
 from .task import Task
 from .util.compat import mutex
 from .util.event import Event
 from .exceptions import WorkflowException
-
+from .bpmn.specs.BoundaryEvent import _BoundaryEventParent
 LOG = logging.getLogger(__name__)
+
 
 
 class Workflow(object):
@@ -69,6 +72,7 @@ class Workflow(object):
 
         # Events.
         self.completed_event = Event()
+        self.cancelled_event = Event()
 
         # Prevent the root task from being executed.
         self.task_tree.state = Task.COMPLETED
@@ -77,6 +81,8 @@ class Workflow(object):
         self.spec.start._predict(start)
         if 'parent' not in kwargs:
             start.task_spec._update(start)
+
+        self.task_mapping = self._get_task_mapping()
         # start.dump()
 
     def is_completed(self):
@@ -89,7 +95,7 @@ class Workflow(object):
         mask = Task.NOT_FINISHED_MASK
         iter = Task.Iterator(self.task_tree, mask)
         try:
-            next(iter)
+            nexttask = next(iter)
         except StopIteration:
             # No waiting tasks found.
             return True
@@ -116,6 +122,29 @@ class Workflow(object):
         if name not in self.locks:
             self.locks[name] = mutex()
         return self.locks[name]
+
+    def _get_task_mapping(self):
+        task_mapping = {}
+        for task in self.task_tree:
+            thread_task_mapping = task_mapping.get(task.thread_id, {})
+            tasks = thread_task_mapping.get(task.task_spec, set())
+            tasks.add(task)
+            thread_task_mapping[task.task_spec] = tasks
+            task_mapping[task.thread_id] = thread_task_mapping
+        return task_mapping
+
+    def update_task_mapping(self):
+        """
+        Update the task_mapping of workflow, make sure the method is called
+        every time you reconstruct task instance.
+        """
+        self.task_mapping = self._get_task_mapping()
+
+    def set_data(self, **kwargs):
+        """
+        Defines the given attribute/value pairs.
+        """
+        self.data.update(kwargs)
 
     def get_data(self, name, default=None):
         """
@@ -146,6 +175,7 @@ class Workflow(object):
             cancel.append(task)
         for task in cancel:
             task.cancel()
+        self.cancelled_event(self)
 
     def get_task_spec_from_name(self, name):
         """
@@ -158,16 +188,22 @@ class Workflow(object):
         """
         return self.spec.get_task_spec_from_name(name)
 
-    def get_task(self, id):
+    def get_task(self, id,tasklist=None):
         """
         Returns the task with the given id.
 
         :type id:integer
         :param id: The id of a task.
+        :param tasklist: Optional cache of get_tasks for operations
+                         where we are calling multiple times as when we
+                         are deserializing the workflow
         :rtype: Task
         :returns: The task with the given id.
         """
-        tasks = [task for task in self.get_tasks() if task.id == id]
+        if tasklist:
+            tasks = [task for task in tasklist if task.id == id]
+        else:
+            tasks = [task for task in self.get_tasks() if task.id == id]
         return tasks[0] if len(tasks) == 1 else None
 
     def get_tasks_from_spec_name(self, name):
@@ -176,11 +212,94 @@ class Workflow(object):
 
         :type name: str
         :param name: The name of a task spec.
-        :rtype: Task
-        :return: The task that relates to the spec with the given name.
+        :rtype: list[Task]
+        :returns: A list of tasks that relate to the spec with the given name.
         """
-        return [task for task in self.get_tasks()
+        return [task for task in self.get_tasks_iterator()
                 if task.task_spec.name == name]
+
+    def empty(self,str):
+        if str == None:
+            return True
+        if str == '':
+            return True
+        return False
+
+    def get_message_name_xlate(self):
+        message_name_xlate = {}
+
+        alltasks = self.get_tasks()
+        tasks = [x for x in alltasks if (x.state == x.READY or x.state== x.WAITING or x.state==x.COMPLETED)
+                 and hasattr(x.parent,'task_spec')]
+        #tasks = self.get_tasks(state=Task.READY)
+
+        for task in tasks:
+            parent = task.parent
+            if hasattr(task.task_spec,'event_definition') \
+                and hasattr(task.task_spec.event_definition,'message'):
+                message_name_xlate[task.task_spec.event_definition.name] = task.task_spec.event_definition.message
+            if isinstance(parent.task_spec,_BoundaryEventParent):
+                for sibling in parent.children:
+                    if hasattr(sibling.task_spec,'event_definition') \
+                       and sibling.task_spec.event_definition is not None:
+                        message_name_xlate[sibling.task_spec.event_definition.name] = \
+                            sibling.task_spec.event_definition.message
+                        # doing this for the case that we have triggered the event and it is now completed
+                        # but the task is still active, so we would like to be able to re-trigger the event
+                        if sibling.state == Task.COMPLETED and task.state == Task.READY:
+                            sibling._setstate(Task.WAITING, force=True)
+        return message_name_xlate
+
+    def message(self,message_name,payload,resultVar):
+
+        message_name_xlate = self.get_message_name_xlate()
+
+        if message_name in message_name_xlate.keys() or \
+            message_name in message_name_xlate.values():
+            if message_name in message_name_xlate.keys():
+                message_name = message_name_xlate[message_name]
+            self.task_tree.internal_data['messages'] = self.task_tree.internal_data.get('messages',{}) # ensure
+            self.task_tree.internal_data['messages'][message_name] = (payload,resultVar)
+        self.refresh_waiting_tasks()
+        self.do_engine_steps()
+        self.task_tree.internal_data['messages'] = {}
+
+    def signal(self, message_name):
+        # breakpoint()
+        message_name_xlate = self.get_message_name_xlate()
+
+        if message_name in message_name_xlate.keys() or \
+            message_name in message_name_xlate.values():
+            if message_name in message_name_xlate.keys():
+                message_name = message_name_xlate[message_name]
+            self.task_tree.internal_data['signals'] = self.task_tree.internal_data.get('signals',{}) # ensure
+            self.task_tree.internal_data['signals'][message_name] = True
+        LOG.debug("signal Workflow instance: %s" % self.task_tree.internal_data)
+        self.refresh_waiting_tasks()
+        LOG.debug("signal Workflow instance: %s" % self.task_tree.internal_data)
+        self.do_engine_steps()
+        self.task_tree.internal_data['signals'] = {}
+
+    def cancel_notify(self):
+        self.task_tree.internal_data['cancels'] = \
+                self.task_tree.internal_data.get('cancels', {})  # ensure
+        self.task_tree.internal_data['cancels']['TokenReset'] = True
+        self.refresh_waiting_tasks()
+        self.do_engine_steps()
+        self.task_tree.internal_data['cancels'] = {}
+
+    def get_flat_nav_list(self):
+        """Returns a navigation list with indentation hints, but the list
+        is completly flat, and a nav item has no children."""
+        from . import navigation
+        return navigation.get_flat_nav_list(self)
+
+    def get_deep_nav_list(self):
+        """Returns a nested navigation list, where indentation hints are
+        applied to recreate a deep structure."""
+        from . import navigation
+        return navigation.get_deep_nav_list(self)
+
 
     def get_tasks(self, state=Task.ANY_MASK):
         """
@@ -192,6 +311,49 @@ class Workflow(object):
         :returns: A list of tasks.
         """
         return [t for t in Task.Iterator(self.task_tree, state)]
+
+    def reset_task_from_id(self, task_id):
+        """
+        Runs the task with the given id.
+
+        :type  task_id: integer
+        :param task_id: The id of the Task object.
+        """
+        if task_id is None:
+            raise WorkflowException(self.spec, 'task_id is None')
+        data = {}
+        if self.last_task and self.last_task.data:
+            data = self.last_task.data
+        for task in self.task_tree:
+            if task.id == task_id:
+                return task.reset_token(data)
+        msg = 'A task with the given task_id (%s) was not found' % task_id
+        raise WorkflowException(self.spec, msg)
+
+    def get_reset_task_spec(self, destination):
+        """
+        Returns a task, that once complete, will reset the workflow back
+        to a previously completed task.
+        :param destination: Task to reset to, on complete.
+        :return: TaskSpec
+        """
+        name = "return_to_" + destination.task_spec.name
+        spec = self.get_task_spec_from_name(name)
+        if not spec:
+            spec = LoopResetTask(self.spec, name, destination.id,
+                                 destination.task_spec.name)
+        return spec
+
+    def get_tasks_iterator(self, state=Task.ANY_MASK):
+        """
+        Returns a iterator of Task objects with the given state.
+
+        :type  state: integer
+        :param state: A bitmask of states.
+        :rtype:  Task.Iterator
+        :returns: A list of tasks.
+        """
+        return Task.Iterator(self.task_tree, state)
 
     def complete_task_from_id(self, task_id):
         """

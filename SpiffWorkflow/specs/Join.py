@@ -134,12 +134,7 @@ class Join(TaskSpec):
         # Look at the tree to find all places where this task is used.
         tasks = []
         for input in self.inputs:
-            for task in my_task.workflow.task_tree:
-                if task.thread_id != my_task.thread_id:
-                    continue
-                if task.task_spec != input:
-                    continue
-                tasks.append(task)
+            tasks += my_task.workflow.task_mapping[my_task.thread_id][input]
 
         # Look up which tasks have already completed.
         waiting_tasks = []
@@ -278,8 +273,10 @@ class Join(TaskSpec):
                 self.entered_event.emit(my_task.workflow, my_task)
                 task._ready()
             else:
-                task.state = Task.COMPLETED
+                task._set_state(Task.COMPLETED)
                 task._drop_children()
+
+
 
     def _on_trigger(self, my_task):
         """

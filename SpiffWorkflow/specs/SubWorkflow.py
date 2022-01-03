@@ -17,6 +17,8 @@ from __future__ import division, absolute_import
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301  USA
 import os
+
+from . import StartTask
 from .base import TaskSpec
 from ..task import Task
 from ..exceptions import WorkflowException
@@ -100,7 +102,10 @@ class SubWorkflow(TaskSpec):
         subworkflow = self._create_subworkflow(my_task)
         subworkflow.completed_event.connect(
             self._on_subworkflow_completed, my_task)
+        self._integrate_subworkflow_tree(my_task, subworkflow)
+        my_task._set_internal_data(subworkflow=subworkflow)
 
+    def _integrate_subworkflow_tree(self, my_task, subworkflow):
         # Integrate the tree of the subworkflow into the tree of this workflow.
         my_task._sync_children(self.outputs, Task.FUTURE)
         for child in my_task.children:
@@ -109,8 +114,6 @@ class SubWorkflow(TaskSpec):
         for child in subworkflow.task_tree.children:
             my_task.children.insert(0, child)
             child.parent = my_task
-
-        my_task._set_internal_data(subworkflow=subworkflow)
 
     def _on_ready_hook(self, my_task):
         # Assign variables, if so requested.
@@ -126,7 +129,9 @@ class SubWorkflow(TaskSpec):
     def _on_subworkflow_completed(self, subworkflow, my_task):
         # Assign variables, if so requested.
         for child in my_task.children:
-            if child.task_spec in self.outputs:
+            if subworkflow.last_task is not None:
+                child.data.update(subworkflow.last_task.data)
+            if not isinstance(child.task_spec, StartTask):
                 for assignment in self.out_assign:
                     assignment.assign(subworkflow, child)
 
@@ -135,9 +140,8 @@ class SubWorkflow(TaskSpec):
 
     def _on_complete_hook(self, my_task):
         for child in my_task.children:
-            if child.task_spec in self.outputs:
-                continue
-            child.task_spec._update(child)
+            if isinstance(child.task_spec, StartTask):
+                child.task_spec._update(child)
 
     def serialize(self, serializer):
         return serializer.serialize_sub_workflow(self)

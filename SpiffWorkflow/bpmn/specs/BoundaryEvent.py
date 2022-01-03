@@ -61,6 +61,12 @@ class _BoundaryEventParent(BpmnSpecMixin):
         return (issubclass(task_spec.__class__, BoundaryEvent) and
                 task_spec._cancel_activity)
 
+    def serialize(self, serializer):
+        return serializer.serialize_boundary_event_parent(self)
+    @classmethod
+    def deserialize(self, serializer, wf_spec, s_state):
+        return serializer.deserialize_boundary_event_parent(wf_spec, s_state, _BoundaryEventParent)
+
 
 class BoundaryEvent(IntermediateCatchEvent):
     """
@@ -77,3 +83,22 @@ class BoundaryEvent(IntermediateCatchEvent):
         super(BoundaryEvent, self).__init__(
             wf_spec, name, event_definition=event_definition, **kwargs)
         self._cancel_activity = cancel_activity
+
+    def accept_message(self, my_task, message):
+        ret = super(BoundaryEvent, self).accept_message(my_task, message)
+        # after accepting message this node will be in READY state but
+        # if for some reason the task we are attached to gets to COMPLETE
+        # state before us then our _BoundaryEventParent will cancel()
+        # this node along with all the other siblings
+        #
+        # to prevent this we complete() this task because _BoundaryEventParent
+        # only cancels unfinished children
+        if ret and my_task._has_state(Task.READY):
+            my_task.complete()
+        return ret
+
+    def serialize(self, serializer):
+        return serializer.serialize_boundary_event(self)
+    @classmethod
+    def deserialize(self, serializer, wf_spec, s_state):
+        return serializer.deserialize_boundary_event(wf_spec, s_state, BoundaryEvent)
